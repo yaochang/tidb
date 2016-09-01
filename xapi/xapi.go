@@ -92,6 +92,7 @@ func (r *selectResult) fetch() {
 			reader:    reader,
 			aggregate: r.aggregate,
 			done:      make(chan error),
+			ch:        make(chan rowItem, 100),
 		}
 		go pr.fetch()
 		r.results <- pr
@@ -135,6 +136,8 @@ type partialResult struct {
 
 	done    chan error
 	fetched bool
+
+	ch chan rowItem
 }
 
 func (pr *partialResult) fetch() {
@@ -154,6 +157,43 @@ func (pr *partialResult) fetch() {
 		pr.done <- errInvalidResp.Gen("[%d %s]", pr.resp.Error.GetCode(), pr.resp.Error.GetMsg())
 	}
 	pr.done <- nil
+
+	defer close(pr.ch)
+	for {
+		if pr.cursor >= len(pr.resp.Rows) {
+			return
+		}
+
+		row := pr.resp.Rows[pr.cursor]
+		data, err := tablecodec.DecodeValues(row.Data, pr.fields, pr.index)
+		if err != nil {
+			pr.done <- errors.Trace(err)
+			return
+		}
+		if data == nil {
+			// When no column is referenced, the data may be nil, like 'select count(*) from t'.
+			// In this case, we need to create a zero length datum slice,
+			// as caller will check if data is nil to finish iteration.
+			data = make([]types.Datum, 0)
+		}
+		var handle int64
+		if !pr.aggregate {
+			handleBytes := row.GetHandle()
+			datums, err := codec.Decode(handleBytes, 1)
+			if err != nil {
+				pr.done <- errors.Trace(err)
+				return
+			}
+			handle = datums[0].GetInt64()
+		}
+		pr.cursor++
+		pr.ch <- rowItem{handle, data}
+	}
+}
+
+type rowItem struct {
+	handle int64
+	data   []types.Datum
 }
 
 // Next returns the next row of the sub result.
@@ -168,29 +208,9 @@ func (pr *partialResult) Next() (handle int64, data []types.Datum, err error) {
 			return 0, nil, err
 		}
 	}
-	if pr.cursor >= len(pr.resp.Rows) {
-		return 0, nil, nil
-	}
-	row := pr.resp.Rows[pr.cursor]
-	data, err = tablecodec.DecodeValues(row.Data, pr.fields, pr.index)
-	if err != nil {
-		return 0, nil, errors.Trace(err)
-	}
-	if data == nil {
-		// When no column is referenced, the data may be nil, like 'select count(*) from t'.
-		// In this case, we need to create a zero length datum slice,
-		// as caller will check if data is nil to finish iteration.
-		data = make([]types.Datum, 0)
-	}
-	if !pr.aggregate {
-		handleBytes := row.GetHandle()
-		datums, err := codec.Decode(handleBytes, 1)
-		if err != nil {
-			return 0, nil, errors.Trace(err)
-		}
-		handle = datums[0].GetInt64()
-	}
-	pr.cursor++
+
+	row := <-pr.ch
+	handle, data = row.handle, row.data
 	return
 }
 
