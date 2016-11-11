@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/juju/errors"
+	"github.com/ngaut/log"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/kv"
@@ -28,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/plan"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/store/localstore"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
@@ -1929,11 +1931,14 @@ func (s *testSessionSuite) TestIssue1265(c *C) {
 
 func (s *testSessionSuite) TestIssue1435(c *C) {
 	defer testleak.AfterTest(c)()
-	store := newStore(c, s.dbName)
+	localstore.MockRemoteStore = true
+	store := newStore(c, s.dbName+"issue1435")
 	se := newSession(c, store, s.dbName)
 	se1 := newSession(c, store, s.dbName)
 	se2 := newSession(c, store, s.dbName)
 
+	ctx := se.(context.Context)
+	sessionctx.GetDomain(ctx).SetLease(20 * time.Millisecond)
 	mustExecSQL(c, se, "drop table if exists t;")
 	mustExecSQL(c, se, "create table t (a int);")
 	mustExecSQL(c, se, "drop table if exists t1;")
@@ -1951,12 +1956,14 @@ func (s *testSessionSuite) TestIssue1435(c *C) {
 		<-start
 		if err == nil {
 			// execute failed
+			log.Errorf("**************************************************1")
 			_, err = exec(s, fmt.Sprintf("insert into %s values(1)", tbl))
 		}
 
 		if err != nil {
 			// table t1 executes failed
 			// table t2 executes successfully
+			log.Errorf("**************************************************2")
 			_, err = exec(s, "commit")
 		} else if tbl == "t2" {
 			err = errors.New("insert result isn't expected")
@@ -1978,9 +1985,10 @@ func (s *testSessionSuite) TestIssue1435(c *C) {
 	default:
 	}
 	// Make sure loading information schema is failed and server is invalid.
-	ctx := se.(context.Context)
 	sessionctx.GetDomain(ctx).SchemaValidity.MockReloadFailed = true
 	sessionctx.GetDomain(ctx).MustReload()
+	lease := sessionctx.GetDomain(ctx).DDL().GetLease()
+	time.Sleep(lease)
 	// Make sure insert to table t1 transaction executes.
 	startCh1 <- struct{}{}
 	// Make sure executing insert statement is failed when server is invalid.
@@ -1996,15 +2004,20 @@ func (s *testSessionSuite) TestIssue1435(c *C) {
 		c.FailNow()
 	default:
 	}
-	sessionctx.GetDomain(ctx).SchemaValidity.SetValidity(true)
+
+	ver, err := store.CurrentVersion()
+	c.Assert(err, IsNil)
+	c.Assert(ver, NotNil)
+	sessionctx.GetDomain(ctx).SchemaValidity.SetValidity(true, ver.Ver)
 	sessionctx.GetDomain(ctx).SchemaValidity.MockReloadFailed = false
+	time.Sleep(lease)
 	mustExecSQL(c, se, "drop table if exists t;")
 	mustExecSQL(c, se, "create table t (a int);")
 	mustExecSQL(c, se, "insert t values (100);")
 	// Make sure insert to table t2 transaction executes.
 	startCh2 <- struct{}{}
 	err = <-endCh2
-	c.Assert(err, IsNil)
+	c.Assert(err, IsNil, Commentf("err:%v", err))
 
 	err = se.Close()
 	c.Assert(err, IsNil)
@@ -2014,6 +2027,7 @@ func (s *testSessionSuite) TestIssue1435(c *C) {
 	c.Assert(err, IsNil)
 	err = store.Close()
 	c.Assert(err, IsNil)
+	localstore.MockRemoteStore = false
 }
 
 // Testcase for session
